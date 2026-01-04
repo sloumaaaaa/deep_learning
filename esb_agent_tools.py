@@ -1,11 +1,13 @@
 """
 ESB Agent Tools - Specialized tools for the academic assistant agent
+Enhanced with comparison, interest matching, and better error handling
 """
 
 import re
-from typing import List
+from typing import List, Dict
 from langchain.tools import tool
 from langchain_core.documents import Document
+from fuzzywuzzy import process, fuzz
 
 
 class ESBTools:
@@ -115,43 +117,50 @@ class ESBTools:
             # Normalize program name
             program_name_lower = program_name.lower().strip()
             
-            # Map common abbreviations to full names
+            # Exact mapping - prioritize exact matches
             program_mapping = {
                 "ba": "master BA",
+                "business analytics": "master BA",
                 "gamma": "master GAMMA",
                 "mkd": "master MKD",
+                "marketing digital": "master MKD",
                 "mdsi": "master MDSI",
                 "cca": "master CCA",
+                "finance digitale": "master finance digitale",
+                "finance": "master finance digitale",
                 "bi": "bachelor BI",
-                "bis": "bachelor BIS",
                 "business intelligence": "bachelor BI",
+                "bis": "bachelor BIS",
                 "business information system": "bachelor BIS",
                 "management": "bachelor management",
                 "comptabilite": "bachelor comptabilite",
-                "comptabilité": "bachelor comptabilite"
+                "comptabilité": "bachelor comptabilite",
+                "accounting": "bachelor comptabilite"
             }
             
-            # Try to find the program name
+            # Try exact match first
             search_name = program_mapping.get(program_name_lower, program_name_lower)
             
             # Search in raw data
             subjects = self.extract_subjects(self.raw_data, search_name)
             
+            # If not found, try fuzzy matching only if no exact match
             if not subjects:
-                # Try alternative names
-                for key, value in program_mapping.items():
-                    if key in program_name_lower or program_name_lower in key:
-                        subjects = self.extract_subjects(self.raw_data, value)
-                        if subjects:
-                            break
+                all_keys = list(program_mapping.keys())
+                match, score = process.extractOne(program_name_lower, all_keys, scorer=fuzz.ratio)
+                if score > 85:  # High threshold for subjects
+                    search_name = program_mapping[match]
+                    subjects = self.extract_subjects(self.raw_data, search_name)
             
             if subjects:
-                result = [f"📖 **Subjects in {program_name}:**", ""]
+                result = [f"📖 **Subjects in {program_name.upper()}:**", ""]
                 for i, subject in enumerate(subjects, 1):
                     result.append(f"{i}. {subject}")
                 return "\n".join(result)
             
-            return f"No subjects found for program: {program_name}. Please check the program name."
+            # Provide helpful suggestion
+            available = ["BA", "GAMMA", "MKD", "MDSI", "CCA", "Finance Digitale", "BI", "BIS", "Management", "Comptabilite"]
+            return f"❌ No subjects found for program: {program_name}\n\n💡 Available programs: {', '.join(available)}"
         
         @tool
         def get_career_prospects(program_name: str) -> str:
@@ -214,6 +223,10 @@ class ESBTools:
             Returns:
                 Relevant information from the knowledge base
             """
+            # Filter out very short or conversational queries
+            if len(query.split()) < 3:
+                return "Please ask a more specific question about ESB programs, subjects, or careers."
+            
             # Use hybrid search
             try:
                 # BM25 search
@@ -235,12 +248,115 @@ class ESBTools:
                         all_docs.append(doc)
                 
                 if all_docs:
-                    # Return top results
-                    context = "\n\n".join([doc.page_content for doc in all_docs[:5]])
-                    return context[:2000]  # Limit context size
+                    # Filter for ESB-relevant content
+                    relevant_docs = []
+                    for doc in all_docs[:5]:
+                        content_lower = doc.page_content.lower()
+                        # Check if content is actually about ESB programs
+                        if any(keyword in content_lower for keyword in ["master", "bachelor", "esb", "programme", "program", "subjects", "jobs", "career"]):
+                            relevant_docs.append(doc)
+                    
+                    if relevant_docs:
+                        context = "\n\n".join([doc.page_content for doc in relevant_docs[:3]])
+                        return context[:1500]  # Limit context size
                 
-                return "No relevant information found."
+                return "I couldn't find specific information about that. Try asking about:\n- Available programs\n- Subjects in a program\n- Career options\n- Comparing programs"
             except Exception as e:
                 return f"Search error: {str(e)}"
         
-        return [search_programs, get_program_subjects, get_career_prospects, search_general_info]
+        @tool
+        def compare_programs(program_names: str) -> str:
+            """
+            Compare two or more programs side by side (subjects, careers, etc.).
+            Use this when users want to compare different programs.
+            
+            Args:
+                program_names: Comma-separated program names (e.g., "BA, GAMMA" or "BI, BIS")
+            
+            Returns:
+                Comparison table of programs
+            """
+            programs = [p.strip() for p in program_names.split(",")]
+            
+            if len(programs) < 2:
+                return "Please provide at least 2 programs to compare, separated by commas."
+            
+            comparison = ["📊 **Program Comparison:**\n"]
+            
+            for prog in programs:
+                # Fuzzy match program name
+                all_progs = ["BA", "GAMMA", "MKD", "MDSI", "CCA", "BI", "BIS", "management", "comptabilite"]
+                matched, score = process.extractOne(prog.upper(), all_progs, scorer=fuzz.ratio)
+                
+                if score > 60:
+                    prog_name = matched
+                    comparison.append(f"\n### {prog_name}")
+                    
+                    # Get subjects
+                    subjects = self.extract_subjects(self.raw_data, f"master {prog_name}" if prog_name in ["BA", "GAMMA", "MKD", "MDSI", "CCA"] else f"bachelor {prog_name}")
+                    if subjects:
+                        comparison.append(f"**Subjects:** {len(subjects)} courses")
+                        comparison.append(f"  Top 5: {', '.join(subjects[:5])}")
+                    
+                    # Get careers
+                    jobs = self.extract_jobs(self.raw_data, prog_name)
+                    if jobs:
+                        comparison.append(f"**Careers:** {len(jobs)} options")
+                        comparison.append(f"  Examples: {', '.join(jobs[:3])}")
+                    
+                    comparison.append("")
+            
+            return "\n".join(comparison)
+        
+        @tool
+        def search_by_interest(interest: str) -> str:
+            """
+            Find programs matching user interests (e.g., "data science", "finance", "marketing").
+            Use when users describe what they want to study rather than asking for specific programs.
+            
+            Args:
+                interest: User's area of interest
+            
+            Returns:
+                Recommended programs based on interest
+            """
+            interest_lower = interest.lower()
+            recommendations = []
+            
+            # Interest mapping
+            interest_map = {
+                "data": ["Master BA (Business Analytics)", "Master GAMMA", "Bachelor BI"],
+                "finance": ["Master Finance Digitale", "Master GAMMA"],
+                "marketing": ["Master MKD (Marketing Digital)"],
+                "digital": ["Master MDSI", "Master MKD"],
+                "accounting": ["Master CCA", "Bachelor Comptabilite"],
+                "management": ["Bachelor Management", "Master MDSI"],
+                "technology": ["Master MDSI", "Bachelor BIS"],
+                "analytics": ["Master BA", "Bachelor BI"],
+                "actuarial": ["Master GAMMA"],
+                "audit": ["Master CCA"]
+            }
+            
+            for keyword, programs in interest_map.items():
+                if keyword in interest_lower:
+                    recommendations.extend(programs)
+            
+            if recommendations:
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_recs = []
+                for prog in recommendations:
+                    if prog not in seen:
+                        seen.add(prog)
+                        unique_recs.append(prog)
+                
+                result = [f"🎯 **Programs matching '{interest}':**\n"]
+                for i, prog in enumerate(unique_recs, 1):
+                    result.append(f"{i}. {prog}")
+                
+                result.append("\n💡 Use get_program_subjects or get_career_prospects to learn more about each!")
+                return "\n".join(result)
+            
+            return f"No specific match for '{interest}'. Try: data, finance, marketing, digital, accounting, management, technology"
+        
+        return [search_programs, get_program_subjects, get_career_prospects, search_general_info, compare_programs, search_by_interest]
